@@ -153,6 +153,26 @@ global_test_counter = 0
 MAX_DEPTH = 100
 
 
+@attr.s(slots=True)
+class TestResult(object):
+    """Result class storing the parts of ConjectureData that we
+    will care about after the original ConjectureData has outlived its
+    usefulness."""
+
+    status = attr.ib()
+    interesting_origin = attr.ib()
+    buffer = attr.ib()
+    blocks = attr.ib()
+    examples = attr.ib()
+    has_discards = attr.ib()
+    output = attr.ib()
+
+    index = attr.ib(init=False)
+
+    def __attrs_post_init__(self):
+        self.index = len(self.buffer)
+
+
 class ConjectureData(object):
     @classmethod
     def for_buffer(self, buffer):
@@ -187,6 +207,7 @@ class ConjectureData(object):
         self.examples = []
         self.example_stack = []
         self.has_discards = False
+        self.__result = None
 
         top = self.start_example(TOP_LABEL)
         assert top.depth == 0
@@ -197,6 +218,25 @@ class ConjectureData(object):
             len(self.buffer),
             ", frozen" if self.frozen else "",
         )
+
+    def as_result(self):
+        """Convert the result of running this test into
+        either an Overrun object or a TestResult."""
+
+        assert self.frozen
+        if self.status == Status.OVERRUN:
+            return Overrun
+        if self.__result is None:
+            self.__result = TestResult(
+                status=self.status,
+                interesting_origin=self.interesting_origin,
+                buffer=self.buffer,
+                examples=self.examples,
+                blocks=self.blocks,
+                has_discards=self.has_discards,
+                output=self.output,
+            )
+        return self.__result
 
     def __assert_not_frozen(self, name):
         if self.frozen:
@@ -211,9 +251,6 @@ class ConjectureData(object):
     @property
     def index(self):
         return len(self.buffer)
-
-    def all_block_bounds(self):
-        return [block.bounds for block in self.blocks]
 
     def note(self, value):
         self.__assert_not_frozen("note")
