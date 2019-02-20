@@ -19,12 +19,19 @@ from __future__ import absolute_import, division, print_function
 
 from hypothesis.internal.reflection import get_pretty_function_description
 from hypothesis.searchstrategy.strategies import SearchStrategy
+from hypothesis.errors import InvalidArgument
+from hypothesis.internal.validation import check_type
 
 
 class FlatMapStrategy(SearchStrategy):
     def __init__(self, strategy, expand):
         super(FlatMapStrategy, self).__init__()
         self.flatmapped_strategy = strategy
+        if not callable(expand):
+            raise InvalidArgument (
+                "Expected callable but got %s"
+                % type(expand).__name__
+            )
         self.expand = expand
 
     def calc_is_empty(self, recur):
@@ -40,7 +47,10 @@ class FlatMapStrategy(SearchStrategy):
 
     def do_draw(self, data):
         source = data.draw(self.flatmapped_strategy)
-        return data.draw(self.expand(source))
+        extended = self.expand(source)
+        check_type(extended, SearchStrategy)
+        return data.draw(extended)
+
 
     @property
     def branches(self):
