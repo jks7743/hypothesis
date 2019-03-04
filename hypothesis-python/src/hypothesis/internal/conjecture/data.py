@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import, division, print_function
 
+from collections import defaultdict
 from enum import IntEnum
 
 import attr
@@ -28,14 +29,30 @@ from hypothesis.internal.compat import (
     hbytes,
     hrange,
     int_from_bytes,
+    int_to_bytes,
     text_type,
     unicode_safe_repr,
 )
+from hypothesis.internal.conjecture.junkdrawer import IntList
 from hypothesis.internal.conjecture.utils import calc_label_from_name
 from hypothesis.internal.escalation import mark_for_escalation
+from hypothesis.utils.conventions import UniqueIdentifier
 
 TOP_LABEL = calc_label_from_name("top")
 DRAW_BYTES_LABEL = calc_label_from_name("draw_bytes() in ConjectureData")
+
+
+class ExtraInformation(object):
+    """A class for holding shared state on a ``ConjectureData`` that should
+    be added to the final ``ConjectureResult``."""
+
+    def __repr__(self):
+        return "ExtraInformation(%s)" % (
+            ", ".join(["%s=%r" % (k, v) for k, v in self.__dict__.items()]),
+        )
+
+    def has_information(self):
+        return bool(self.__dict__)
 
 
 class Status(IntEnum):
@@ -78,8 +95,14 @@ class Example(object):
     # Index of this example inside the overall list of examples.
     index = attr.ib()
 
+    # Index of the parent of this example, or None if this is the root.
+    parent = attr.ib()
+
     start = attr.ib()
     end = attr.ib(default=None)
+
+    # Index of example in parent's children, or None if this is the root.
+    child_index = attr.ib(default=None)
 
     # An example is "trivial" if it only contains forced bytes and zero bytes.
     # All examples start out as trivial, and then get marked non-trivial when
@@ -95,9 +118,12 @@ class Example(object):
     # List of child examples, represented as indices into the example list.
     children = attr.ib(default=attr.Factory(list), repr=False)
 
-    @property
-    def length(self):
-        return self.end - self.start
+    # We access length a lot, and Python is annoyingly bad at basic integer
+    # arithmetic, so it makes sense to cache this on a field for speed
+    # reasons. It also reduces allocation, though most of the integers
+    # allocated from this should be easily collected garbage and/or
+    # small enough to be interned.
+    length = attr.ib(init=False, repr=False)
 
 
 @attr.s(slots=True, frozen=True)
@@ -138,6 +164,157 @@ class Block(object):
         return self.forced or self.all_zero
 
 
+class Blocks(object):
+    """A lazily calculated list of blocks for a particular ``ConjectureResult``
+    or ``ConjectureData`` object.
+
+    Pretends to be a list containing ``Block`` objects but actually only
+    contains their endpoints right up until the point where you want to
+    access the actual block, at which point it is constructed.
+
+    This is designed to be as space efficient as possible, so will at
+    various points silently transform its representation into one
+    that is better suited for the current access pattern.
+
+    In addition, it has a number of convenience methods for accessing
+    properties of the block object at index ``i`` that should generally
+    be preferred to using the Block objects directly, as it will not
+    have to allocate the actual object."""
+
+    __slots__ = ("endpoints", "owner", "__blocks", "__count", "__sparse")
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.endpoints = IntList()
+        self.__blocks = {}
+        self.__count = 0
+        self.__sparse = True
+
+    def add_endpoint(self, n):
+        """Add n to the list of endpoints."""
+        assert isinstance(self.owner, ConjectureData)
+        self.endpoints.append(n)
+
+    def transfer_ownership(self, new_owner):
+        """Used to move ``Blocks`` over to a ``ConjectureResult`` object
+        when that is read to be used and we no longer want to keep the
+        whole ``ConjectureData`` around."""
+        assert isinstance(new_owner, ConjectureResult)
+        self.owner = new_owner
+        self.__check_completion()
+
+    def start(self, i):
+        """Equivalent to self[i].start."""
+        if i == 0:
+            return 0
+        else:
+            return self.end(i - 1)
+
+    def end(self, i):
+        """Equivalent to self[i].end."""
+        return self.endpoints[i]
+
+    def bounds(self, i):
+        """Equivalent to self[i].bounds."""
+        return (self.start(i), self.end(i))
+
+    def all_bounds(self):
+        """Equivalent to [(b.start, b.end) for b in self]."""
+        prev = 0
+        for e in self.endpoints:
+            yield (prev, e)
+            prev = e
+
+    def __len__(self):
+        return len(self.endpoints)
+
+    def __known_block(self, i):
+        try:
+            return self.__blocks[i]
+        except (KeyError, IndexError):
+            return None
+
+    def __getitem__(self, i):
+        n = len(self)
+        if i < -n or i >= n:
+            raise IndexError("Index %d out of range [-%d, %d)" % (i, n, n))
+        if i < 0:
+            i += n
+        assert i >= 0
+        result = self.__known_block(i)
+        if result is not None:
+            return result
+
+        # We store the blocks as a sparse dict mapping indices to the
+        # actual result, but this isn't the best representation once we
+        # stop being sparse and want to use most of the blocks. Switch
+        # over to a list at that point.
+        if self.__sparse and len(self.__blocks) * 2 >= len(self):
+            new_blocks = [None] * len(self)
+            for k, v in self.__blocks.items():
+                new_blocks[k] = v
+            self.__sparse = False
+            self.__blocks = new_blocks
+            assert self.__blocks[i] is None
+
+        start = self.start(i)
+        end = self.end(i)
+
+        # We keep track of the number of blocks that have actually been
+        # instantiated so that when every block that could be instantiated
+        # has been we know that the list is complete and can throw away
+        # some data that we no longer need.
+        self.__count += 1
+
+        # Integrity check: We can't have allocated more blocks than we have
+        # positions for blocks.
+        assert self.__count <= len(self)
+        result = Block(
+            start=start,
+            end=end,
+            index=i,
+            forced=start in self.owner.forced_indices,
+            all_zero=not any(self.owner.buffer[start:end]),
+        )
+        try:
+            self.__blocks[i] = result
+        except IndexError:
+            assert isinstance(self.__blocks, list)
+            assert len(self.__blocks) < len(self)
+            self.__blocks.extend([None] * (len(self) - len(self.__blocks)))
+            self.__blocks[i] = result
+
+        self.__check_completion()
+
+        return result
+
+    def __check_completion(self):
+        """The list of blocks is complete if we have created every ``Block``
+        object that we currently good and know that no more will be created.
+
+        If this happens then we don't need to keep the reference to the
+        owner around, and delete it so that there is no circular reference.
+        The main benefit of this is that the gc doesn't need to run to collect
+        this because normal reference counting is enough.
+        """
+        if self.__count == len(self) and isinstance(self.owner, ConjectureResult):
+            self.owner = None
+
+    def __iter__(self):
+        for i in hrange(len(self)):
+            yield self[i]
+
+    def __repr__(self):
+        parts = []
+        for i in hrange(len(self)):
+            b = self.__known_block(i)
+            if b is None:
+                parts.append("...")
+            else:
+                parts.append(repr(b))
+        return "Block([%s])" % (", ".join(parts),)
+
+
 class _Overrun(object):
     status = Status.OVERRUN
 
@@ -151,6 +328,105 @@ global_test_counter = 0
 
 
 MAX_DEPTH = 100
+
+
+def calc_examples(self):
+    """Build the list of examples from either a ``ConjectureResult``
+    or a ``ConjectureData`` object by interpreting the recorded
+    example boundaries and parsing them into a tree of ``Example``
+    objects, returning the resulting list.
+
+    This is needed because we want to calculate these lazily.
+    The ``Example`` tree is fairly memory hungry and mildly
+    expensive to compute and, especially during generation, we
+    will often not need it, so we only want to compute it on
+    demand."""
+    assert self.example_boundaries
+
+    example_stack = []
+    examples = []
+
+    non_trivial_block_starts = {
+        b.start for b in self.blocks if not (b.all_zero or b.forced)
+    }
+
+    for index, labels in self.example_boundaries:
+        for label in labels:
+            if label in (Stop, StopDiscard):
+                discard = label is StopDiscard
+                k = example_stack.pop()
+                ex = examples[k]
+                ex.end = index
+                ex.length = ex.end - ex.start
+
+                if ex.length == 0:
+                    ex.trivial = True
+
+                if example_stack and not ex.trivial:
+                    examples[example_stack[-1]].trivial = False
+
+                ex.discarded = discard
+            else:
+                i = len(examples)
+                ex = Example(
+                    index=i,
+                    depth=len(example_stack),
+                    label=label,
+                    start=index,
+                    trivial=index not in non_trivial_block_starts,
+                    parent=example_stack[-1] if example_stack else None,
+                )
+                examples.append(ex)
+                if example_stack:
+                    p = example_stack[-1]
+                    children = examples[p].children
+                    ex.child_index = len(children)
+                    children.append(ex)
+                example_stack.append(i)
+    for ex in examples:
+        assert ex.end is not None
+
+    assert examples
+    return examples
+
+
+@attr.s(slots=True)
+class ConjectureResult(object):
+    """Result class storing the parts of ConjectureData that we
+    will care about after the original ConjectureData has outlived its
+    usefulness."""
+
+    status = attr.ib()
+    interesting_origin = attr.ib()
+    buffer = attr.ib()
+    blocks = attr.ib()
+    example_boundaries = attr.ib()
+    output = attr.ib()
+    extra_information = attr.ib()
+    has_discards = attr.ib()
+    forced_indices = attr.ib(repr=False)
+
+    __examples = attr.ib(init=False, repr=False, default=None)
+
+    index = attr.ib(init=False)
+
+    def __attrs_post_init__(self):
+        self.index = len(self.buffer)
+        self.forced_indices = frozenset(self.forced_indices)
+
+    @property
+    def examples(self):
+        if self.__examples is None:
+            self.__examples = calc_examples(self)
+            self.example_boundaries = None
+
+        assert self.example_boundaries is None
+        return self.__examples
+
+
+# Special "labels" used to indicate the end of example boundaries
+Stop = UniqueIdentifier("Stop")
+StopDiscard = UniqueIdentifier("StopDiscard")
 
 
 class ConjectureData(object):
@@ -167,9 +443,12 @@ class ConjectureData(object):
         self.is_find = False
         self._draw_bytes = draw_bytes
         self.overdraw = 0
-        self.block_starts = {}
-        self.blocks = []
+        self.__block_starts = defaultdict(list)
+        self.__block_starts_calculated_to = 0
+
+        self.blocks = Blocks(self)
         self.buffer = bytearray()
+        self.index = 0
         self.output = u""
         self.status = Status.VALID
         self.frozen = False
@@ -183,13 +462,23 @@ class ConjectureData(object):
         self.interesting_origin = None
         self.draw_times = []
         self.max_depth = 0
-
-        self.examples = []
-        self.example_stack = []
         self.has_discards = False
 
-        top = self.start_example(TOP_LABEL)
-        assert top.depth == 0
+        self.example_boundaries = []
+
+        self.__result = None
+
+        # Normally unpopulated but we need this in the niche case
+        # that self.as_result() is Overrun but we still want the
+        # examples for reporting purposes.
+        self.__examples = None
+
+        # We want the top level example to have depth 0, so we start
+        # at -1.
+        self.depth = -1
+
+        self.start_example(TOP_LABEL)
+        self.extra_information = ExtraInformation()
 
     def __repr__(self):
         return "ConjectureData(%s, %d bytes%s)" % (
@@ -198,22 +487,33 @@ class ConjectureData(object):
             ", frozen" if self.frozen else "",
         )
 
+    def as_result(self):
+        """Convert the result of running this test into
+        either an Overrun object or a ConjectureResult."""
+
+        assert self.frozen
+        if self.status == Status.OVERRUN:
+            return Overrun
+        if self.__result is None:
+            self.__result = ConjectureResult(
+                status=self.status,
+                interesting_origin=self.interesting_origin,
+                buffer=self.buffer,
+                example_boundaries=self.example_boundaries,
+                blocks=self.blocks,
+                output=self.output,
+                extra_information=self.extra_information
+                if self.extra_information.has_information()
+                else None,
+                has_discards=self.has_discards,
+                forced_indices=self.forced_indices,
+            )
+            self.blocks.transfer_ownership(self.__result)
+        return self.__result
+
     def __assert_not_frozen(self, name):
         if self.frozen:
             raise Frozen("Cannot call %s on frozen ConjectureData" % (name,))
-
-    @property
-    def depth(self):
-        # We always have a single example wrapping everything. We want to treat
-        # that as depth 0 rather than depth 1.
-        return len(self.example_stack) - 1
-
-    @property
-    def index(self):
-        return len(self.buffer)
-
-    def all_block_bounds(self):
-        return [block.bounds for block in self.blocks]
 
     def note(self, value):
         self.__assert_not_frozen("note")
@@ -261,153 +561,165 @@ class ConjectureData(object):
         finally:
             self.stop_example()
 
+    def current_example_labels(self):
+        if not self.example_boundaries or self.example_boundaries[-1][0] < self.index:
+            self.example_boundaries.append((self.index, []))
+        return self.example_boundaries[-1][-1]
+
     def start_example(self, label):
         self.__assert_not_frozen("start_example")
-
-        i = len(self.examples)
-        new_depth = self.depth + 1
-        ex = Example(index=i, depth=new_depth, label=label, start=self.index)
-        self.examples.append(ex)
-        if self.example_stack:
-            p = self.example_stack[-1]
-            self.examples[p].children.append(ex)
-        self.example_stack.append(i)
-        self.max_depth = max(self.max_depth, self.depth)
-        return ex
+        self.current_example_labels().append(label)
+        self.depth += 1
+        # Logically it would make sense for this to just be
+        # ``self.depth = max(self.depth, self.max_depth)``, which is what it used to
+        # be until we ran the code under tracemalloc and found a rather significant
+        # chunk of allocation was happening here. This was presumably due to varargs
+        # or the like, but we didn't investigate further given that it was easy
+        # to fix with this check.
+        if self.depth > self.max_depth:
+            self.max_depth = self.depth
 
     def stop_example(self, discard=False):
         if self.frozen:
             return
-
-        k = self.example_stack.pop()
-        ex = self.examples[k]
-        ex.end = self.index
-
-        if self.example_stack and not ex.trivial:
-            self.examples[self.example_stack[-1]].trivial = False
-
-        # We don't want to count empty examples as discards even if the flag
-        # says we should. This leads to situations like
-        # https://github.com/HypothesisWorks/hypothesis/issues/1230
-        # where it can look like we should discard data but there's nothing
-        # useful for us to do.
-        if self.index == ex.start:
-            discard = False
-
-        ex.discarded = discard
-
         if discard:
             self.has_discards = True
+        self.current_example_labels().append(StopDiscard if discard else Stop)
+        self.depth -= 1
+        assert self.depth >= -1
 
     def note_event(self, event):
         self.events.add(event)
+
+    @property
+    def examples(self):
+        result = self.as_result()
+        if result is Overrun:
+            if self.__examples is None:
+                self.__examples = calc_examples(self)
+            return self.__examples
+        else:
+            return result.examples
 
     def freeze(self):
         if self.frozen:
             assert isinstance(self.buffer, hbytes)
             return
         self.finish_time = benchmark_time()
+        assert len(self.buffer) == self.index
 
-        while self.example_stack:
+        # Always finish by closing all remaining examples so that we have a
+        # valid tree.
+        while self.depth >= 0:
             self.stop_example()
 
         self.frozen = True
-
-        if self.status >= Status.VALID:
-            discards = []
-            for ex in self.examples:
-                if ex.length == 0:
-                    continue
-                if discards:
-                    u, v = discards[-1]
-                    if u <= ex.start <= ex.end <= v:
-                        continue
-                if ex.discarded:
-                    discards.append((ex.start, ex.end))
-                    continue
 
         self.buffer = hbytes(self.buffer)
         self.events = frozenset(self.events)
         del self._draw_bytes
 
-    def draw_bits(self, n):
+    def draw_bits(self, n, forced=None):
+        """Return an ``n``-bit integer from the underlying source of
+        bytes. If ``forced`` is set to an integer will instead
+        ignore the underlying source and simulate a draw as if it had
+        returned that integer."""
         self.__assert_not_frozen("draw_bits")
         if n == 0:
-            result = 0
-        elif n % 8 == 0:
-            return int_from_bytes(self.draw_bytes(n // 8))
+            return 0
+        assert n > 0
+        n_bytes = bits_to_bytes(n)
+        self.__check_capacity(n_bytes)
+
+        if forced is not None:
+            buf = bytearray(int_to_bytes(forced, n_bytes))
         else:
-            n_bytes = (n // 8) + 1
-            self.__check_capacity(n_bytes)
             buf = bytearray(self._draw_bytes(self, n_bytes))
-            assert len(buf) == n_bytes
+        assert len(buf) == n_bytes
+
+        # If we have a number of bits that is not a multiple of 8
+        # we have to mask off the high bits.
+        if n % 8 != 0:
             mask = (1 << (n % 8)) - 1
+            assert mask != 0
             buf[0] &= mask
             self.masked_indices[self.index] = mask
-            buf = hbytes(buf)
-            self.__write(buf)
-            result = int_from_bytes(buf)
+        buf = hbytes(buf)
+        result = int_from_bytes(buf)
+
+        self.start_example(DRAW_BYTES_LABEL)
+        initial = self.index
+
+        block = Block(
+            start=initial,
+            end=initial + n_bytes,
+            index=len(self.blocks),
+            forced=forced is not None,
+            all_zero=result == 0,
+        )
+
+        if block.forced:
+            self.forced_indices.update(hrange(block.start, block.end))
+
+        self.buffer.extend(buf)
+        self.index = len(self.buffer)
+
+        if forced is not None:
+            self.forced_indices.update(hrange(initial, self.index))
+
+        self.blocks.add_endpoint(self.index)
+
+        self.stop_example()
 
         assert bit_length(result) <= n
         return result
 
+    @property
+    def block_starts(self):
+        while self.__block_starts_calculated_to < len(self.blocks):
+            i = self.__block_starts_calculated_to
+            self.__block_starts_calculated_to += 1
+            u, v = self.blocks.bounds(i)
+            self.__block_starts[v - u].append(u)
+        return self.__block_starts
+
+    def draw_bytes(self, n):
+        """Draw n bytes from the underlying source."""
+        return int_to_bytes(self.draw_bits(8 * n), n)
+
     def write(self, string):
-        string = hbytes(string)
+        """Write ``string`` to the output buffer."""
         self.__assert_not_frozen("write")
-        self.__check_capacity(len(string))
-        original = self.index
-        self.__write(string, forced=True)
-        self.forced_indices.update(hrange(original, self.index))
-        return string
+        string = hbytes(string)
+        if not string:
+            return
+        self.draw_bits(len(string) * 8, forced=int_from_bytes(string))
+        return self.buffer[-len(string) :]
 
     def __check_capacity(self, n):
         if self.index + n > self.max_length:
-            self.overdraw = self.index + n - self.max_length
-            self.status = Status.OVERRUN
-            self.freeze()
-            raise StopTest(self.testcounter)
+            self.mark_overrun()
 
-    def __write(self, result, forced=False):
-        ex = self.start_example(DRAW_BYTES_LABEL)
-        initial = self.index
-        n = len(result)
-
-        block = Block(
-            start=initial,
-            end=initial + n,
-            index=len(self.blocks),
-            forced=forced,
-            all_zero=not any(result),
-        )
-        ex.trivial = block.trivial
-
-        self.block_starts.setdefault(n, []).append(block.start)
-        self.blocks.append(block)
-        assert self.blocks[block.index] is block
-        assert len(result) == n
-        assert self.index == initial
-        self.buffer.extend(result)
-        self.stop_example()
-
-    def draw_bytes(self, n):
-        self.__assert_not_frozen("draw_bytes")
-        if n == 0:
-            return hbytes(b"")
-        self.__check_capacity(n)
-        result = self._draw_bytes(self, n)
-        assert len(result) == n
-        self.__write(result)
-        return hbytes(result)
+    def conclude_test(self, status, interesting_origin=None):
+        assert (interesting_origin is None) or (status == Status.INTERESTING)
+        self.__assert_not_frozen("conclude_test")
+        self.interesting_origin = interesting_origin
+        self.status = status
+        self.freeze()
+        raise StopTest(self.testcounter)
 
     def mark_interesting(self, interesting_origin=None):
-        self.__assert_not_frozen("mark_interesting")
-        self.interesting_origin = interesting_origin
-        self.status = Status.INTERESTING
-        self.freeze()
-        raise StopTest(self.testcounter)
+        self.conclude_test(Status.INTERESTING, interesting_origin)
 
     def mark_invalid(self):
-        self.__assert_not_frozen("mark_invalid")
-        self.status = Status.INVALID
-        self.freeze()
-        raise StopTest(self.testcounter)
+        self.conclude_test(Status.INVALID)
+
+    def mark_overrun(self):
+        self.conclude_test(Status.OVERRUN)
+
+
+def bits_to_bytes(n):
+    """The number of bytes required to represent an n-bit number.
+    Equivalent to (n + 7) // 8, but slightly faster. This really is
+    called enough times that that matters."""
+    return (n + 7) >> 3

@@ -646,16 +646,9 @@ def test_clears_out_its_database_on_shrinking(
     assert len(list(db.fetch(runner.database_key))) == 1
 
 
-def test_can_delete_intervals(monkeypatch):
-    def generate_new_examples(self):
-        self.test_function(ConjectureData.for_buffer(hbytes([255] * 10 + [1, 3])))
-
-    monkeypatch.setattr(
-        ConjectureRunner, "generate_new_examples", generate_new_examples
-    )
-    monkeypatch.setattr(Shrinker, "shrink", fixate(Shrinker.adaptive_example_deletion))
-
-    def f(data):
+def test_can_delete_intervals():
+    @shrinking_from([255] * 10 + [1, 3])
+    def shrinker(data):
         while True:
             n = data.draw_bits(8)
             if n == 255:
@@ -667,9 +660,9 @@ def test_can_delete_intervals(monkeypatch):
         if data.draw_bits(8) == 3:
             data.mark_interesting()
 
-    runner = ConjectureRunner(f, settings=settings(database=None))
-    runner.run()
-    x, = runner.interesting_examples.values()
+    shrinker.fixate_shrink_passes(["adaptive_example_deletion"])
+
+    x = shrinker.shrink_target
     assert x.buffer == hbytes([1, 3])
 
 
@@ -710,18 +703,9 @@ def test_shrinks_both_interesting_examples(monkeypatch):
     assert runner.interesting_examples[1].buffer == hbytes([1])
 
 
-def test_duplicate_blocks_that_go_away(monkeypatch):
-    monkeypatch.setattr(Shrinker, "shrink", Shrinker.minimize_duplicated_blocks)
-    monkeypatch.setattr(
-        ConjectureRunner,
-        "generate_new_examples",
-        lambda runner: runner.test_function(
-            ConjectureData.for_buffer(hbytes([1, 1, 1, 2] * 2 + [5] * 2))
-        ),
-    )
-
-    @run_to_buffer
-    def x(data):
+def test_duplicate_blocks_that_go_away():
+    @shrinking_from([1, 1, 1, 2] * 2 + [5] * 2)
+    def shrinker(data):
         x = data.draw_bits(32)
         y = data.draw_bits(32)
         if x != y:
@@ -730,7 +714,8 @@ def test_duplicate_blocks_that_go_away(monkeypatch):
         if len(set(b)) <= 1:
             data.mark_interesting()
 
-    assert x == hbytes([0] * 8)
+    shrinker.fixate_shrink_passes(["minimize_duplicated_blocks"])
+    assert shrinker.shrink_target.buffer == hbytes([0] * 8)
 
 
 def test_accidental_duplication(monkeypatch):
@@ -746,9 +731,7 @@ def test_accidental_duplication(monkeypatch):
         if len(set(b)) == 1:
             data.mark_interesting()
 
-    shrinker.clear_passes()
-    shrinker.add_new_pass("minimize_duplicated_blocks")
-    shrinker.shrink()
+    shrinker.fixate_shrink_passes(["minimize_duplicated_blocks"])
     assert list(shrinker.buffer) == [5] * 7
 
 
@@ -815,6 +798,19 @@ def test_discarding_iterates_to_fixed_point():
     assert list(shrinker.buffer) == [1, 0]
 
 
+def test_discarding_is_not_fooled_by_empty_discards():
+    @shrinking_from(hbytes([1, 1]))
+    def shrinker(data):
+        data.draw_bits(1)
+        data.start_example(0)
+        data.stop_example(discard=True)
+        data.draw_bits(1)
+        data.mark_interesting()
+
+    shrinker.remove_discarded()
+    assert shrinker.shrink_target.has_discards
+
+
 def shrink_pass(name):
     def run(self):
         self.run_shrink_pass(name)
@@ -831,7 +827,7 @@ def test_discarding_can_fail(monkeypatch):
         data.mark_interesting()
 
     shrinker.remove_discarded()
-    assert shrinker.shrink_target.has_discards
+    assert any(e.discarded and e.length > 0 for e in shrinker.shrink_target.examples)
 
 
 @pytest.mark.parametrize("bits", [3, 9])
@@ -930,14 +926,6 @@ def test_handles_nesting_of_discard_correctly(monkeypatch):
     assert x == hbytes([1, 1])
 
 
-def fixate_shrink_passes(shrinker, *passes):
-    prev = None
-    while prev is not shrinker.shrink_target:
-        prev = shrinker.shrink_target
-        for sp in passes:
-            shrinker.run_shrink_pass(sp)
-
-
 def test_can_zero_subintervals(monkeypatch):
     @shrinking_from(hbytes([3, 0, 0, 0, 1]) * 10)
     def shrinker(data):
@@ -950,7 +938,7 @@ def test_can_zero_subintervals(monkeypatch):
                 return
         data.mark_interesting()
 
-    fixate_shrink_passes(shrinker, "zero_examples")
+    shrinker.fixate_shrink_passes(["zero_examples"])
     assert list(shrinker.buffer) == [0, 1] * 10
 
 
@@ -976,7 +964,7 @@ def test_can_pass_to_an_indirect_descendant(monkeypatch):
         if hbytes(data.buffer) in good:
             data.mark_interesting()
 
-    fixate_shrink_passes(shrinker, "pass_to_descendant")
+    shrinker.fixate_shrink_passes(["pass_to_descendant"])
 
     assert shrinker.shrink_target.buffer == target
 
@@ -995,31 +983,21 @@ def shrink(buffer, *passes):
     return accept
 
 
-def test_shrinking_blocks_from_common_offset(monkeypatch):
-    monkeypatch.setattr(
-        Shrinker,
-        "shrink",
-        lambda self: (
-            # Run minimize_individual_blocks twice so we have both blocks show
-            # as changed regardless of which order this happens in.
-            self.minimize_individual_blocks(),
-            self.minimize_individual_blocks(),
-            self.lower_common_block_offset(),
-        ),
-    )
-
-    monkeypatch.setattr(
-        ConjectureRunner,
-        "generate_new_examples",
-        lambda runner: runner.test_function(ConjectureData.for_buffer([11, 10])),
-    )
-
-    @run_to_buffer
-    def x(data):
+def test_shrinking_blocks_from_common_offset():
+    @shrinking_from([11, 10])
+    def shrinker(data):
         m = data.draw_bits(8)
         n = data.draw_bits(8)
         if abs(m - n) <= 1 and max(m, n) > 0:
             data.mark_interesting()
+
+    # Run minimize_individual_blocks twice so we have both blocks show
+    # as changed regardless of which order this happens in.
+    shrinker.minimize_individual_blocks()
+    shrinker.minimize_individual_blocks()
+    shrinker.lower_common_block_offset()
+
+    x = shrinker.shrink_target.buffer
 
     assert sorted(x) == [0, 1]
 
@@ -1220,7 +1198,7 @@ def test_finding_a_minimal_balanced_binary_tree():
         if not b:
             data.mark_interesting()
 
-    fixate_shrink_passes(shrinker, "adaptive_example_deletion", "reorder_examples")
+    shrinker.fixate_shrink_passes(["adaptive_example_deletion", "reorder_examples"])
 
     assert list(shrinker.shrink_target.buffer) == [1, 0, 1, 0, 1, 0, 0]
 
@@ -1423,7 +1401,7 @@ def test_pandas_hack():
         if data.draw_bits(8) == 7:
             data.mark_interesting()
 
-    shrinker.run_shrink_pass("block_program('-XX')")
+    shrinker.run_shrink_pass(block_program("-XX"))
     assert list(shrinker.shrink_target.buffer) == [1, 7]
 
 
@@ -1554,3 +1532,73 @@ def test_try_shrinking_blocks_out_of_bounds():
         data.mark_interesting()
 
     assert not shrinker.try_shrinking_blocks((1,), hbytes([1]))
+
+
+def test_block_programs_are_adaptive():
+    @shrinking_from(hbytes(1000) + hbytes([1]))
+    def shrinker(data):
+        while not data.draw_bits(1):
+            pass
+        data.mark_interesting()
+
+    p = shrinker.add_new_pass(block_program("X"))
+    shrinker.fixate_shrink_passes([p.name])
+
+    assert len(shrinker.shrink_target.buffer) == 1
+    assert shrinker.calls <= 60
+
+
+def test_zero_examples_is_adaptive():
+    @shrinking_from(hbytes([1]) * 1001)
+    def shrinker(data):
+        for _ in hrange(1000):
+            data.draw_bits(1)
+        if data.draw_bits(1):
+            data.mark_interesting()
+
+    shrinker.fixate_shrink_passes(["zero_examples"])
+
+    assert shrinker.shrink_target.buffer == hbytes(1000) + hbytes([1])
+    assert shrinker.calls <= 60
+
+
+def test_zero_examples_does_not_try_to_adapt_across_different_sizes():
+    @shrinking_from([1, 0, 0] * 10 + [1])
+    def shrinker(data):
+        for _ in hrange(10):
+            data.draw_bits(1)
+            data.draw_bits(16)
+        if data.draw_bits(1):
+            data.mark_interesting()
+
+    initial = shrinker.calls
+    shrinker.zero_examples()
+    assert shrinker.shrink_target.buffer == hbytes(30) + hbytes([1])
+
+    # Tried each of the 1-bit blocks, plus the whole example, plus the final
+    # single-bit block. Did not try to expand regions into the trivial two-byte
+    # blocks on each side.
+    assert shrinker.calls == initial + 12
+
+
+def test_stable_identifiers_match_their_examples():
+    def tree(data):
+        data.start_example(1)
+        n = data.draw_bits(1)
+        label = data.draw_bits(8)
+        if n:
+            tree(data)
+            tree(data)
+        data.stop_example(1)
+        return label
+
+    initial = hbytes([1, 10, 0, 0, 1, 0, 0, 10, 0, 0])
+
+    @shrinking_from(initial)
+    def shrinker(data):
+        tree(data)
+        data.mark_interesting()
+
+    for ex in shrinker.examples:
+        id = shrinker.stable_identifier_for_example(ex)
+        assert shrinker.example_for_stable_identifier(id) is ex

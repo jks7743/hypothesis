@@ -38,11 +38,13 @@ from hypothesis.internal.compat import (
 from hypothesis.internal.conjecture.data import (
     MAX_DEPTH,
     ConjectureData,
+    ConjectureResult,
     Overrun,
     Status,
     StopTest,
 )
 from hypothesis.internal.conjecture.datatree import DataTree
+from hypothesis.internal.conjecture.junkdrawer import pop_random
 from hypothesis.internal.conjecture.shrinker import Shrinker, sort_key
 from hypothesis.internal.healthcheck import fail_health_check
 from hypothesis.reporting import debug_report
@@ -97,7 +99,6 @@ class ConjectureRunner(object):
         self.target_selector = TargetSelector(self.random)
 
         self.interesting_examples = {}
-        self.covering_examples = {}
 
         self.shrunk_examples = set()
 
@@ -191,7 +192,7 @@ class ConjectureRunner(object):
 
             if changed:
                 self.save_buffer(data.buffer)
-                self.interesting_examples[key] = data
+                self.interesting_examples[key] = data.as_result()
                 self.__data_cache.pin(data.buffer)
                 self.shrunk_examples.discard(key)
 
@@ -330,10 +331,7 @@ class ConjectureRunner(object):
         return b".".join((self.database_key, b"coverage"))
 
     def note_details(self, data):
-        if data.status == Status.OVERRUN:
-            self.__data_cache[data.buffer] = Overrun
-        else:
-            self.__data_cache[data.buffer] = data
+        self.__data_cache[data.buffer] = data.as_result()
         runtime = max(data.finish_time - data.start_time, 0.0)
         self.all_runtimes.append(runtime)
         self.all_drawtimes.extend(data.draw_times)
@@ -424,6 +422,7 @@ class ConjectureRunner(object):
             choices = data.block_starts.get(n, [])
             if choices:
                 i = self.random.choice(choices)
+                assert i + n <= len(data.buffer)
                 return hbytes(data.buffer[i : i + n])
             else:
                 result = uniform(self.random, n)
@@ -483,11 +482,13 @@ class ConjectureRunner(object):
             if data.index + n > len(target_data[0].buffer):
                 result = uniform(self.random, n)
             else:
-                result = self.random.choice(bits)(data, n)
+                draw = self.random.choice(bits)
+                result = draw(data, n)
             p = prefix[0]
             if data.index < len(p):
                 start = p[data.index : data.index + n]
                 result = start + result[len(start) :]
+            assert len(result) == n
             return self.__zero_bound(data, result)
 
         return mutate_from
@@ -616,10 +617,19 @@ class ConjectureRunner(object):
             # to be whatever value is written there). That means that once we've
             # tried the zero value, there's nothing left for us to do, so we
             # exit early here.
-            for i in hrange(self.cap):
-                if i not in zero_data.forced_indices:
+            has_non_forced = False
+
+            # It's impossible to fall out of this loop normally because if we
+            # did then that would mean that all blocks are writes, so we would
+            # already have triggered the exhaustedness check on the tree and
+            # finished running.
+            for b in zero_data.blocks:  # pragma: no branch
+                if b.start >= self.cap:
                     break
-            else:
+                if not b.forced:
+                    has_non_forced = True
+                    break
+            if not has_non_forced:
                 self.exit_with(ExitReason.finished)
 
         self.health_check_state = HealthCheckState()
@@ -638,8 +648,6 @@ class ConjectureRunner(object):
                 else:
                     result = uniform(self.random, n)
                 return self.__zero_bound(data, result)
-
-            targets_found = len(self.covering_examples)
 
             last_data = ConjectureData(
                 max_length=self.settings.buffer_size, draw_bytes=draw_bytes
@@ -695,16 +703,12 @@ class ConjectureRunner(object):
             else:
                 origin = self.target_selector.select()
                 mutations += 1
-                targets_found = len(self.covering_examples)
                 data = ConjectureData(
                     draw_bytes=mutator(origin), max_length=self.settings.buffer_size
                 )
                 self.test_function(data)
                 data.freeze()
-                if (
-                    data.status > origin.status
-                    or len(self.covering_examples) > targets_found
-                ):
+                if data.status > origin.status:
                     mutations = 0
                 elif data.status < origin.status or mutations >= 10:
                     # Cap the variations of a single example and move on to
@@ -805,15 +809,22 @@ class ConjectureRunner(object):
         fresh result.
         """
         buffer = hbytes(buffer)
+
+        def check_result(result):
+            assert result is Overrun or (
+                isinstance(result, ConjectureResult) and result.status != Status.OVERRUN
+            )
+            return result
+
         try:
-            return self.__data_cache[buffer]
+            return check_result(self.__data_cache[buffer])
         except KeyError:
             pass
 
         rewritten, status = self.tree.rewrite(buffer)
 
         try:
-            result = self.__data_cache[rewritten]
+            result = check_result(self.__data_cache[rewritten])
         except KeyError:
             pass
         else:
@@ -828,8 +839,9 @@ class ConjectureRunner(object):
         result = None
 
         if status != Status.OVERRUN:
-            result = ConjectureData.for_buffer(buffer)
-            self.test_function(result)
+            data = ConjectureData.for_buffer(buffer)
+            self.test_function(data)
+            result = check_result(data.as_result())
             assert status is None or result.status == status
             status = result.status
         if status == Status.OVERRUN:
@@ -882,20 +894,6 @@ def _draw_successor(rnd, xs):
 
 def uniform(random, n):
     return int_to_bytes(random.getrandbits(n * 8), n)
-
-
-def pop_random(random, values):
-    """Remove a random element of values, possibly changing the ordering of its
-    elements."""
-
-    # We pick the element at a random index. Rather than removing that element
-    # from the list (which would be an O(n) operation), we swap it to the end
-    # and return the last element of the list. This changes the order of
-    # the elements, but as long as these elements are only accessed through
-    # random sampling that doesn't matter.
-    i = random.randrange(0, len(values))
-    values[i], values[-1] = values[-1], values[i]
-    return values.pop()
 
 
 class TargetSelector(object):
