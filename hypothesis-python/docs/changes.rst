@@ -21,6 +21,212 @@ Hypothesis APIs come in three flavours:
 You should generally assume that an API is internal unless you have specific
 information to the contrary.
 
+.. _v4.7.19:
+
+-------------------
+4.7.19 - 2019-03-04
+-------------------
+
+This release makes some micro-optimisations to certain calculations performed in the shrinker.
+These should particularly speed up large test cases where the shrinker makes many small changes.
+It will also reduce the amount allocated, but most of this is garbage that would have been immediately thrown away,
+so you probably won't see much effect specifically from that.
+
+.. _v4.7.18:
+
+-------------------
+4.7.18 - 2019-03-03
+-------------------
+
+This patch removes some overhead from :func:`~hypothesis.extra.numpy.arrays`
+with a constant shape and dtype.  The resulting performance improvement is
+modest, but worthwile for small arrays.
+
+.. _v4.7.17:
+
+-------------------
+4.7.17 - 2019-03-01
+-------------------
+
+This release makes some micro-optimisations within Hypothesis's internal representation of test cases.
+This should cause heavily nested test cases to allocate less during generation and shrinking,
+which should speed things up slightly.
+
+.. _v4.7.16:
+
+-------------------
+4.7.16 - 2019-02-28
+-------------------
+
+This changes the order in which Hypothesis runs certain operations during shrinking.
+This should significantly decrease memory usage and speed up shrinking of large examples.
+
+.. _v4.7.15:
+
+-------------------
+4.7.15 - 2019-02-28
+-------------------
+
+This release allows Hypothesis to calculate a number of attributes of generated test cases lazily.
+This should significantly reduce memory usage and modestly improve performance,
+especially for large test cases.
+
+.. _v4.7.14:
+
+-------------------
+4.7.14 - 2019-02-28
+-------------------
+
+This release reduces the number of operations the shrinker will try when reordering parts of a test case.
+This should in some circumstances significantly speed up shrinking. It *may* result in different final test cases,
+and if so usually slightly worse ones, but it should not generally have much impact on the end result as the operations removed were typically useless.
+
+.. _v4.7.13:
+
+-------------------
+4.7.13 - 2019-02-27
+-------------------
+
+This release changes how Hypothesis reorders examples within a test case during shrinking.
+This should make shrinking considerably faster.
+
+.. _v4.7.12:
+
+-------------------
+4.7.12 - 2019-02-27
+-------------------
+
+This release slightly improves the shrinker's ability to replace parts of a test case with their minimal version,
+by allowing it to do so in bulk rather than one at a time. Where this is effective, shrinker performance should be modestly improved.
+
+.. _v4.7.11:
+
+-------------------
+4.7.11 - 2019-02-25
+-------------------
+
+This release makes some micro-optimisations to common operations performed during shrinking.
+Shrinking should now be slightly faster, especially for large examples with relatively fast test functions.
+
+.. _v4.7.10:
+
+-------------------
+4.7.10 - 2019-02-25
+-------------------
+
+This release is a purely internal refactoring of Hypothesis's API for representing test cases.
+There should be no user visible effect.
+
+.. _v4.7.9:
+
+------------------
+4.7.9 - 2019-02-24
+------------------
+
+This release changes certain shrink passes to make them more efficient when
+they aren't making progress.
+
+.. _v4.7.8:
+
+------------------
+4.7.8 - 2019-02-23
+------------------
+
+This patch removes some unused code, which makes the internals
+a bit easier to understand.  There is no user-visible impact.
+
+.. _v4.7.7:
+
+------------------
+4.7.7 - 2019-02-23
+------------------
+
+This release reduces the number of operations the shrinker will try when reordering parts of a test case.
+This should in some circumstances significantly speed up shrinking. It *may* result in different final test cases,
+and if so usually slightly worse ones, but it should not generally have much impact on the end result as the operations removed were typically useless.
+
+.. _v4.7.6:
+
+------------------
+4.7.6 - 2019-02-23
+------------------
+
+This patch removes some unused code from the shrinker.
+There is no user-visible change.
+
+.. _v4.7.5:
+
+------------------
+4.7.5 - 2019-02-23
+------------------
+
+This release changes certain shrink passes to make them *adaptive* - that is,
+in cases where they are successfully making progress they may now do so significantly
+faster.
+
+.. _v4.7.4:
+
+------------------
+4.7.4 - 2019-02-22
+------------------
+
+This is a docs-only patch, noting that because the :pypi:`lark-parser` is under active
+development at version 0.x, ``hypothesis[lark]`` APIs may break in minor
+releases if necessary to keep up with the upstream package.
+
+.. _v4.7.3:
+
+------------------
+4.7.3 - 2019-02-22
+------------------
+
+This changes Hypothesis to no longer import various test frameworks by default (if they are installed).
+which will speed up the initial ``import hypothesis`` call.
+
+.. _v4.7.2:
+
+------------------
+4.7.2 - 2019-02-22
+------------------
+
+This release changes Hypothesis's internal representation of a test case to calculate some expensive structural information on demand rather than eagerly.
+This should reduce memory usage a fair bit, and may make generation somewhat faster.
+
+.. _v4.7.1:
+
+------------------
+4.7.1 - 2019-02-21
+------------------
+
+This release refactors the internal representation of previously run test cases.
+The main thing you should see as a result is that Hypothesis becomes somewhat less memory hungry.
+
+.. _v4.7.0:
+
+------------------
+4.7.0 - 2019-02-21
+------------------
+
+This patch allows :func:`~hypothesis.extra.numpy.array_shapes` to generate shapes
+with side-length or even dimension zero, though the minimum still defaults to
+one.  These shapes are rare and have some odd behavior, but are particularly
+important to test for just that reason!
+
+In a related bigfix, :func:`~hypothesis.extra.numpy.arrays` now supports generating
+zero-dimensional arrays with `dtype=object` and a strategy for iterable elements.
+Previously, the array element would incorrectly be set to the first item in the
+generated iterable.
+
+Thanks to Ryan Turner for continuing to improve our Numpy support.
+
+.. _v4.6.1:
+
+------------------
+4.6.1 - 2019-02-19
+------------------
+
+This release is a trivial micro-optimisation inside Hypothesis which should result in it using significantly less memory.
+
 .. _v4.6.0:
 
 ------------------
