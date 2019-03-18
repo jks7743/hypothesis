@@ -22,7 +22,12 @@ import pytest
 from hypothesis import given, strategies as st
 from hypothesis.errors import Frozen
 from hypothesis.internal.compat import hbytes, hrange
-from hypothesis.internal.conjecture.data import ConjectureData, Status, StopTest
+from hypothesis.internal.conjecture.data import (
+    ConjectureData,
+    DataObserver,
+    Status,
+    StopTest,
+)
 from hypothesis.searchstrategy.strategies import SearchStrategy
 
 
@@ -219,3 +224,79 @@ def test_handles_indices_like_a_list():
 
     with pytest.raises(IndexError):
         d.blocks[-n - 1]
+
+
+def test_can_observe_draws():
+    class LoggingObserver(DataObserver):
+        def __init__(self):
+            self.log = []
+
+        def draw_bits(self, *args):
+            self.log.append(("draw",) + args)
+
+        def conclude_test(self, *args):
+            assert x.frozen
+            self.log.append(("concluded",) + args)
+
+    observer = LoggingObserver()
+    x = ConjectureData.for_buffer(hbytes([1, 2, 3]), observer=observer)
+
+    x.draw_bits(1)
+    x.draw_bits(7, forced=10)
+    x.draw_bits(8)
+    with pytest.raises(StopTest):
+        x.conclude_test(Status.INTERESTING, interesting_origin="neat")
+
+    assert observer.log == [
+        ("draw", 1, False, 1),
+        ("draw", 7, True, 10),
+        ("draw", 8, False, 3),
+        ("concluded", Status.INTERESTING, "neat"),
+    ]
+
+
+def test_calls_concluded_implicitly():
+    class NoteConcluded(DataObserver):
+        def conclude_test(self, status, reason):
+            assert x.frozen
+            self.conclusion = (status, reason)
+
+    observer = NoteConcluded()
+
+    x = ConjectureData.for_buffer(hbytes([1]), observer=observer)
+    x.draw_bits(1)
+    x.freeze()
+
+    assert observer.conclusion == (Status.VALID, None)
+
+
+def test_handles_start_indices_like_a_list():
+    n = 5
+    d = ConjectureData.for_buffer([1] * n)
+    for _ in hrange(n):
+        d.draw_bits(1)
+
+    for i in hrange(-2 * n, 2 * n + 1):
+        try:
+            start = d.blocks.start(i)
+        except IndexError:
+            # Directly retrieving the start position failed, so check that
+            # indexing also fails.
+            with pytest.raises(IndexError):
+                d.blocks[i]
+            continue
+
+        # Directly retrieving the start position succeeded, so check that
+        # indexing also succeeds, and gives the same position.
+        assert start == d.blocks[i].start
+
+
+def test_last_block_length():
+    d = ConjectureData.for_buffer([0] * 15)
+
+    with pytest.raises(IndexError):
+        d.blocks.last_block_length
+
+    for n in hrange(1, 5 + 1):
+        d.draw_bits(n * 8)
+        assert d.blocks.last_block_length == n

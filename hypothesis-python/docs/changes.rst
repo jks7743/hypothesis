@@ -21,6 +21,122 @@ Hypothesis APIs come in three flavours:
 You should generally assume that an API is internal unless you have specific
 information to the contrary.
 
+.. _v4.11.7:
+
+-------------------
+4.11.7 - 2019-03-18
+-------------------
+
+This change makes a tiny improvement to the core engine's bookkeeping.
+There is no user-visible change.
+
+.. _v4.11.6:
+
+-------------------
+4.11.6 - 2019-03-15
+-------------------
+
+This release changes some of Hypothesis's internal shrinking behaviour in order to reduce memory usage and hopefully improve performance.
+
+.. _v4.11.5:
+
+-------------------
+4.11.5 - 2019-03-13
+-------------------
+
+This release adds a micro-optimisation to how Hypothesis handles debug reporting internally.
+Hard to shrink test may see a slight performance improvement, but in most common scenarios it is unlikely to be noticeable.
+
+.. _v4.11.4:
+
+-------------------
+4.11.4 - 2019-03-13
+-------------------
+
+This release removes some redundant code that was no longer needed but was still running a significant amount of computation and allocation on the hot path.
+This should result in a modest speed improvement for most tests, especially those with large test cases.
+
+.. _v4.11.3:
+
+-------------------
+4.11.3 - 2019-03-13
+-------------------
+
+This release adds a micro-optimisation to how Hypothesis caches test cases.
+This will cause a small improvement in speed and memory usage for large test cases,
+but in most common scenarios it is unlikely to be noticeable.
+
+.. _v4.11.2:
+
+-------------------
+4.11.2 - 2019-03-13
+-------------------
+
+This release removes some internal code that populates a field that is no longer used anywhere.
+This should result in some modest performance and speed improvements and no other user visible effects.
+
+.. _v4.11.1:
+
+-------------------
+4.11.1 - 2019-03-13
+-------------------
+
+This is a formatting-only patch, enabled by a new version of :pypi:`isort`.
+
+.. _v4.11.0:
+
+-------------------
+4.11.0 - 2019-03-12
+-------------------
+
+This release deprecates :func:`~hypothesis.strategies.sampled_from` with empty
+sequences.  This returns :func:`~hypothesis.strategies.nothing`, which gives a
+clear error if used directly... but simply vanishes if combined with another
+strategy.
+
+Tests that silently generate less than expected are a serious problem for
+anyone relying on them to find bugs, and we think reliability more important
+than convenience in this case.
+
+.. _v4.10.0:
+
+-------------------
+4.10.0 - 2019-03-11
+-------------------
+
+This release improves Hypothesis's to detect flaky tests, by noticing when the behaviour of the test changes between runs.
+In particular this will notice many new cases where data generation depends on external state (e.g. external sources of randomness) and flag those as flaky sooner and more reliably.
+
+The basis of this feature is a considerable reengineering of how Hypothesis stores its history of test cases,
+so on top of this its memory usage should be considerably reduced.
+
+.. _v4.9.0:
+
+------------------
+4.9.0 - 2019-03-09
+------------------
+
+This release adds the strategy :func:`~hypothesis.extra.numpy.valid_tuple_axes`,
+which generates tuples of axis-indices that can be passed to the ``axis`` argument
+in NumPy's sequential functions (e.g. :func:`numpy:numpy.sum`).
+
+Thanks to Ryan Soklaski for this strategy.
+
+.. _v4.8.0:
+
+------------------
+4.8.0 - 2019-03-06
+------------------
+
+This release significantly tightens validation in :class:`hypothesis.settings`.
+:obj:`~hypothesis.settings.max_examples`, :obj:`~hypothesis.settings.buffer_size`,
+and :obj:`~hypothesis.settings.stateful_step_count` must be positive integers;
+:obj:`~hypothesis.settings.deadline` must be a positive number or ``None``; and
+:obj:`~hypothesis.settings.derandomize` must be either ``True`` or ``False``.
+
+As usual, this replaces existing errors with a more helpful error and starts new
+validation checks as deprecation warnings.
+
 .. _v4.7.19:
 
 -------------------

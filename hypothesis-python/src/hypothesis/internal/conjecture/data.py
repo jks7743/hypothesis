@@ -101,9 +101,6 @@ class Example(object):
     start = attr.ib()
     end = attr.ib(default=None)
 
-    # Index of example in parent's children, or None if this is the root.
-    child_index = attr.ib(default=None)
-
     # An example is "trivial" if it only contains forced bytes and zero bytes.
     # All examples start out as trivial, and then get marked non-trivial when
     # we see a byte that is neither forced nor zero.
@@ -205,6 +202,8 @@ class Blocks(object):
 
     def start(self, i):
         """Equivalent to self[i].start."""
+        i = self._check_index(i)
+
         if i == 0:
             return 0
         else:
@@ -225,6 +224,10 @@ class Blocks(object):
             yield (prev, e)
             prev = e
 
+    @property
+    def last_block_length(self):
+        return self.end(-1) - self.start(-1)
+
     def __len__(self):
         return len(self.endpoints)
 
@@ -234,12 +237,16 @@ class Blocks(object):
         except (KeyError, IndexError):
             return None
 
-    def __getitem__(self, i):
+    def _check_index(self, i):
         n = len(self)
         if i < -n or i >= n:
             raise IndexError("Index %d out of range [-%d, %d)" % (i, n, n))
         if i < 0:
             i += n
+        return i
+
+    def __getitem__(self, i):
+        i = self._check_index(i)
         assert i >= 0
         result = self.__known_block(i)
         if result is not None:
@@ -380,7 +387,6 @@ def calc_examples(self):
                 if example_stack:
                     p = example_stack[-1]
                     children = examples[p].children
-                    ex.child_index = len(children)
                     children.append(ex)
                 example_stack.append(i)
     for ex in examples:
@@ -388,6 +394,30 @@ def calc_examples(self):
 
     assert examples
     return examples
+
+
+class DataObserver(object):
+    """Observer class for recording the behaviour of a
+    ConjectureData object, primarily used for tracking
+    the behaviour in the tree cache."""
+
+    def conclude_test(self, status, interesting_origin):
+        """Called when ``conclude_test`` is called on the
+        observed ``ConjectureData``, with the same arguments.
+
+        Note that this is called after ``freeze`` has completed.
+        """
+        pass
+
+    def draw_bits(self, n_bits, forced, value):
+        """Called when ``draw_bits`` is called on on the
+        observed ``ConjectureData``.
+        * ``n_bits`` is the number of bits drawn.
+        *  ``forced`` is True if the corresponding
+           draw was forced or ``False`` otherwise.
+        * ``value`` is the result that ``draw_bits`` returned.
+        """
+        pass
 
 
 @attr.s(slots=True)
@@ -429,16 +459,27 @@ Stop = UniqueIdentifier("Stop")
 StopDiscard = UniqueIdentifier("StopDiscard")
 
 
+# Masks for masking off the first byte of an n-bit buffer.
+# The appropriate mask is stored at position n % 8.
+BYTE_MASKS = [(1 << n) - 1 for n in hrange(8)]
+BYTE_MASKS[0] = 255
+
+
 class ConjectureData(object):
     @classmethod
-    def for_buffer(self, buffer):
+    def for_buffer(self, buffer, observer=None):
         buffer = hbytes(buffer)
         return ConjectureData(
             max_length=len(buffer),
             draw_bytes=lambda data, n: hbytes(buffer[data.index : data.index + n]),
+            observer=observer,
         )
 
-    def __init__(self, max_length, draw_bytes):
+    def __init__(self, max_length, draw_bytes, observer=None):
+        if observer is None:
+            observer = DataObserver()
+        assert isinstance(observer, DataObserver)
+        self.observer = observer
         self.max_length = max_length
         self.is_find = False
         self._draw_bytes = draw_bytes
@@ -458,7 +499,6 @@ class ConjectureData(object):
         self.start_time = benchmark_time()
         self.events = set()
         self.forced_indices = set()
-        self.masked_indices = {}
         self.interesting_origin = None
         self.draw_times = []
         self.max_depth = 0
@@ -618,6 +658,7 @@ class ConjectureData(object):
         self.buffer = hbytes(self.buffer)
         self.events = frozenset(self.events)
         del self._draw_bytes
+        self.observer.conclude_test(self.status, self.interesting_origin)
 
     def draw_bits(self, n, forced=None):
         """Return an ``n``-bit integer from the underlying source of
@@ -639,27 +680,14 @@ class ConjectureData(object):
 
         # If we have a number of bits that is not a multiple of 8
         # we have to mask off the high bits.
-        if n % 8 != 0:
-            mask = (1 << (n % 8)) - 1
-            assert mask != 0
-            buf[0] &= mask
-            self.masked_indices[self.index] = mask
+        buf[0] &= BYTE_MASKS[n % 8]
         buf = hbytes(buf)
         result = int_from_bytes(buf)
 
+        self.observer.draw_bits(n, forced is not None, result)
+
         self.start_example(DRAW_BYTES_LABEL)
         initial = self.index
-
-        block = Block(
-            start=initial,
-            end=initial + n_bytes,
-            index=len(self.blocks),
-            forced=forced is not None,
-            all_zero=result == 0,
-        )
-
-        if block.forced:
-            self.forced_indices.update(hrange(block.start, block.end))
 
         self.buffer.extend(buf)
         self.index = len(self.buffer)
